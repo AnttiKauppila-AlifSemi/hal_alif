@@ -221,6 +221,25 @@ int se_service_get_last_set_run_cfg(run_profile_t *pp);
 int se_service_set_run_cfg(run_profile_t *pp);
 
 /**
+ * @brief Set run profile using MHU polling.
+ *
+ * Same as se_service_set_run_cfg() but always uses ipm_poll_* so the
+ * MHU ISR is not required. Safe to call with irq_lock() held.
+ *
+ * Does not wait on svc_mutex (K_NO_WAIT). If SE is not marked ready,
+ * wakes it with polled heartbeats (same as ensure_ready, no MHU ISR).
+ * Returns -EBUSY if another thread holds the mutex.
+ *
+ * @param pp Pointer to run_profile_t with the desired profile.
+ * @retval 0 Success.
+ * @retval -EINVAL @p pp is NULL.
+ * @retval -EAGAIN Operation timed out. Retry after a delay.
+ * @retval -EBUSY SE is busy. Retry after a delay.
+ * @return Positive error code returned by SE for a failed service request.
+ */
+int se_service_set_run_cfg_poll(run_profile_t *pp);
+
+/**
  * @brief Get current off profile.
  *
  * @param wp Pointer to off_profile_t to receive the profile data.

@@ -402,17 +402,22 @@ static void callback_for_send_msg(const struct device *dev, void *user_data, uin
  * The semaphores svc_recv_sem and svc_send_sem are used with timeout
  * to make sure data is received or sent.
  *
+ * Interrupt/sem mode is used when the thread can yield, unless
+ * @p force_poll is set (for thread-context callers that hold interrupts locked).
+ *
  * parameters,
  * @ptr     - placeholder for data to be sent.
  * @size    - size of data.
  * @timeout - Timeout in milliseconds.
+ * @force_poll - Use ipm_poll_* even if k_can_yield() is true.
  *
  * returns,
  * 0      - success.
  * -EAGAIN - timed out waiting for SE.
  * -EBUSY  - SE has not consumed previous message.
  */
-static int send_msg_to_se(uint32_t *ptr, uint32_t size, uint32_t timeout)
+static int send_msg_to_se_ex(uint32_t *ptr, uint32_t size, uint32_t timeout,
+			     bool force_poll)
 {
 	int err;
 	int service_id = ((service_header_t *)ptr)->hdr_service_id;
@@ -421,7 +426,7 @@ static int send_msg_to_se(uint32_t *ptr, uint32_t size, uint32_t timeout)
 	__asm__ volatile("dmb 0xF" ::: "memory");
 	sys_cache_data_flush_range(ptr, size);
 
-	if (k_can_yield()) {
+	if (k_can_yield() && !force_poll) {
 		int wait = 0;
 
 		/*
@@ -495,6 +500,11 @@ poll_cleanup:
 	return 0;
 }
 
+static int send_msg_to_se(uint32_t *ptr, uint32_t size, uint32_t timeout)
+{
+	return send_msg_to_se_ex(ptr, size, timeout, false);
+}
+
 /**
  * @brief Internal: Synchronize with SE (assumes svc_mutex is held)
  *
@@ -506,7 +516,7 @@ poll_cleanup:
  * -EAGAIN - Timed out waiting for SE response.
  * -EBUSY  - SE communication channel is busy.
  */
-static int se_service_sync_locked(void)
+static int se_service_sync_locked(bool force_poll)
 {
 	int err, i = 0;
 
@@ -514,8 +524,9 @@ static int se_service_sync_locked(void)
 	se_service_all_svc_d.service_header.hdr_service_id = SERVICE_MAINTENANCE_HEARTBEAT_ID;
 
 	while (i < MAX_TRIES) {
-		err = send_msg_to_se((uint32_t *)&se_service_all_svc_d.service_header,
-				     sizeof(se_service_all_svc_d.service_header), SYNC_TIMEOUT);
+		err = send_msg_to_se_ex((uint32_t *)&se_service_all_svc_d.service_header,
+					sizeof(se_service_all_svc_d.service_header),
+					SYNC_TIMEOUT, force_poll);
 		if (!err) {
 			return 0;
 		}
@@ -537,7 +548,7 @@ int se_service_sync(void)
 		return ret;
 	}
 
-	ret = se_service_sync_locked();
+	ret = se_service_sync_locked(false);
 
 	k_mutex_unlock(&svc_mutex);
 	return ret;
@@ -582,7 +593,7 @@ static int se_service_ensure_ready(void)
 	}
 
 	/* Perform SE sync while holding mutex */
-	ret = se_service_sync_locked();
+	ret = se_service_sync_locked(false);
 	if (ret == 0) {
 		atomic_set(&se_ready, 1);
 		LOG_DBG("SE now ready to receive service calls");
@@ -1272,7 +1283,7 @@ static bool se_service_profile_changed(const run_profile_t *pp)
 	       pp->vdd_ioflex_3V3 != cached_run_profile.vdd_ioflex_3V3;
 }
 
-int se_service_set_run_cfg(run_profile_t *pp)
+static int se_service_set_run_cfg_common(run_profile_t *pp, bool poll)
 {
 	int err, resp_err = -1;
 
@@ -1281,16 +1292,35 @@ int se_service_set_run_cfg(run_profile_t *pp)
 		return -EINVAL;
 	}
 
-	/* Ensure SE is ready to receive service calls */
-	err = se_service_ensure_ready();
-	if (err) {
-		return err;
-	}
+	if (poll) {
+		/*
+		 * Caller may hold irq_lock() (e.g. from idle/S2RAM). Do not
+		 * wait on the mutex. Wake SE with polled heartbeats.
+		 */
+		err = k_mutex_lock(&svc_mutex, K_NO_WAIT);
+		if (err) {
+			LOG_ERR("SE mutex busy (error = %d)\n", err);
+			return -EBUSY;
+		}
+		if (!atomic_get(&se_ready)) {
+			err = se_service_sync_locked(true);
+			if (err) {
+				k_mutex_unlock(&svc_mutex);
+				return err;
+			}
+			atomic_set(&se_ready, 1);
+		}
+	} else {
+		err = se_service_ensure_ready();
+		if (err) {
+			return err;
+		}
 
-	err = k_mutex_lock(&svc_mutex, K_MSEC(MUTEX_TIMEOUT));
-	if (err) {
-		LOG_ERR("Unable to lock mutex (error = %d)\n", err);
-		return err;
+		err = k_mutex_lock(&svc_mutex, K_MSEC(MUTEX_TIMEOUT));
+		if (err) {
+			LOG_ERR("Unable to lock mutex (error = %d)\n", err);
+			return err;
+		}
 	}
 
 	/* Check if profile changed - skip SE call if unchanged */
@@ -1315,8 +1345,9 @@ int se_service_set_run_cfg(run_profile_t *pp)
 	se_service_all_svc_d.set_run_d.send_power_domains = pp->power_domains;
 	se_service_all_svc_d.set_run_d.send_vdd_ioflex_3V3 = pp->vdd_ioflex_3V3;
 
-	err = send_msg_to_se((uint32_t *)&se_service_all_svc_d.set_run_d,
-			     sizeof(se_service_all_svc_d.set_run_d), SERVICE_TIMEOUT);
+	err = send_msg_to_se_ex((uint32_t *)&se_service_all_svc_d.set_run_d,
+				sizeof(se_service_all_svc_d.set_run_d), SERVICE_TIMEOUT,
+				poll);
 	resp_err = se_service_all_svc_d.set_run_d.resp_error_code;
 
 	if (err) {
@@ -1336,6 +1367,16 @@ int se_service_set_run_cfg(run_profile_t *pp)
 
 	k_mutex_unlock(&svc_mutex);
 	return 0;
+}
+
+int se_service_set_run_cfg(run_profile_t *pp)
+{
+	return se_service_set_run_cfg_common(pp, false);
+}
+
+int se_service_set_run_cfg_poll(run_profile_t *pp)
+{
+	return se_service_set_run_cfg_common(pp, true);
 }
 
 int se_service_get_off_cfg(off_profile_t *wp)
